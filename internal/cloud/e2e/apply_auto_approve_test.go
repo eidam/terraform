@@ -13,6 +13,7 @@ import (
 )
 
 func Test_terraform_apply_autoApprove(t *testing.T) {
+	skipIfMissingEnvVar(t)
 	skipWithoutRemoteTerraformVersion(t)
 
 	ctx := context.Background()
