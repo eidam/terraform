@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/hashicorp/terraform/internal/backend"
@@ -809,20 +810,29 @@ func (m *Meta) backendFromState() (backend.Backend, tfdiags.Diagnostics) {
 
 // Unconfiguring a backend (moving from backend => local).
 func (m *Meta) backend_c_r_S(c *configs.Backend, cHash int, sMgr *clistate.LocalState, output bool) (backend.Backend, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
 	s := sMgr.State()
+
+	cloudMode := cloud.DetectConfigChangeType(s.Backend, c, false)
+	diags = diags.Append(m.assertSupportedCloudInitOptions(cloudMode))
+	if diags.HasErrors() {
+		return nil, diags
+	}
 
 	// Get the backend type for output
 	backendType := s.Backend.Type
 
-	if s.Backend.Type == "cloud" {
+	if cloudMode == cloud.ConfigMigrationOut {
 		m.Ui.Output(strings.TrimSpace(outputBackendMigrateLocalFromCloud))
 	} else {
 		m.Ui.Output(fmt.Sprintf(strings.TrimSpace(outputBackendMigrateLocal), s.Backend.Type))
 	}
 
 	// Grab a purely local backend to get the local state if it exists
-	localB, diags := m.Backend(&BackendOpts{ForceLocal: true, Init: true})
-	if diags.HasErrors() {
+	localB, moreDiags := m.Backend(&BackendOpts{ForceLocal: true, Init: true})
+	diags = diags.Append(moreDiags)
+	if moreDiags.HasErrors() {
 		return nil, diags
 	}
 
@@ -868,11 +878,7 @@ func (m *Meta) backend_c_r_S(c *configs.Backend, cHash int, sMgr *clistate.Local
 
 // Configuring a backend for the first time.
 func (m *Meta) backend_C_r_s(c *configs.Backend, cHash int, sMgr *clistate.LocalState) (backend.Backend, tfdiags.Diagnostics) {
-	// Get the backend
-	b, configVal, diags := m.backendInitFromConfig(c)
-	if diags.HasErrors() {
-		return nil, diags
-	}
+	var diags tfdiags.Diagnostics
 
 	// Grab a purely local backend to get the local state if it exists
 	localB, localBDiags := m.Backend(&BackendOpts{ForceLocal: true, Init: true})
@@ -906,6 +912,19 @@ func (m *Meta) backend_C_r_s(c *configs.Backend, cHash int, sMgr *clistate.Local
 		} else {
 			log.Printf("[TRACE] Meta.Backend: ignoring local %q workspace because its state is empty", workspace)
 		}
+	}
+
+	cloudMode := cloud.DetectConfigChangeType(nil, c, len(localStates) > 0)
+	diags = diags.Append(m.assertSupportedCloudInitOptions(cloudMode))
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	// Get the backend
+	b, configVal, moreDiags := m.backendInitFromConfig(c)
+	diags = diags.Append(moreDiags)
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
 	if len(localStates) > 0 {
@@ -999,6 +1018,8 @@ func (m *Meta) backend_C_r_s(c *configs.Backend, cHash int, sMgr *clistate.Local
 
 // Changing a previously saved backend.
 func (m *Meta) backend_C_r_S_changed(c *configs.Backend, cHash int, sMgr *clistate.LocalState, output bool) (backend.Backend, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
 	if output {
 		// Notify the user
 		m.Ui.Output(m.Colorize().Color(fmt.Sprintf(
@@ -1009,9 +1030,16 @@ func (m *Meta) backend_C_r_S_changed(c *configs.Backend, cHash int, sMgr *clista
 	// Get the old state
 	s := sMgr.State()
 
-	// Get the backend
-	b, configVal, diags := m.backendInitFromConfig(c)
+	cloudMode := cloud.DetectConfigChangeType(s.Backend, c, false)
+	diags = diags.Append(m.assertSupportedCloudInitOptions(cloudMode))
 	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	// Get the backend
+	b, configVal, moreDiags := m.backendInitFromConfig(c)
+	diags = diags.Append(moreDiags)
+	if moreDiags.HasErrors() {
 		return nil, diags
 	}
 
@@ -1290,6 +1318,55 @@ func (m *Meta) remoteVersionCheck(b backend.Backend, workspace string) tfdiags.D
 		}
 	}
 
+	return diags
+}
+
+// assertSupportedCloudInitOptions returns diagnostics with errors if the
+// init-related command line options (implied inside the Meta receiver)
+// are incompatible with the given cloud configuration change mode.
+func (m *Meta) assertSupportedCloudInitOptions(mode cloud.ConfigChangeMode) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+	if mode.InvolvesCloud() {
+		log.Printf("[TRACE] Meta.Backend: Terraform Cloud mode initialization type: %s", mode)
+		if m.reconfigure {
+			if mode.IsCloudMigration() {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Invalid command-line option",
+					"The -reconfigure option is unsupported when entering or leaving Terraform Cloud mode, because activating and deactivating Terraform Cloud mode involves some additional steps.",
+				))
+			} else {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Invalid command-line option",
+					"The -reconfigure option is for in-place reconfiguration of state backends only, and is not applicable to Terraform Cloud-based configurations.\n\nIn Terraform Cloud mode, initialization always activates any new Cloud configuration settings.",
+				))
+			}
+		}
+		if m.migrateState {
+			name := "-migrate-state"
+			if m.forceInitCopy {
+				// -force copy implies -migrate-state in "terraform init",
+				// so m.migrateState is forced to true in this case even if
+				// the user didn't actually specify it. We'll use the other
+				// name here to avoid being confusing, then.
+				name = "-force-copy"
+			}
+			if mode.IsCloudMigration() {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Invalid command-line option",
+					fmt.Sprintf("The %s option is for migration between state backends only, and is not applicable to Terraform Cloud-based configurations.\n\nTerraform Cloud migration has additional steps, configured by interactive prompts.", name),
+				))
+			} else {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Invalid command-line option",
+					fmt.Sprintf("The %s option is for migration between state backends only, and is not applicable to Terraform Cloud-based configurations.\n\nIn Terraform Cloud mode, state storage is handled by Terraform Cloud and so the state storage location is not configurable.", name),
+				))
+			}
+		}
+	}
 	return diags
 }
 
